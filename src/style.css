@@ -1,0 +1,34 @@
+/* style.css — Global styles for Road Rage */
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+html, body {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #000;
+    cursor: crosshair;
+    /* Prevent text selection during gameplay */
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+#game-container {
+    width: 100%;
+    height: 100%;
+    position: fixed;
+    top: 0;
+    left: 0;
+}
+
+#game-container canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+}
