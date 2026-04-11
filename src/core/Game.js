@@ -1,6 +1,8 @@
 /**
  * Game.js — Master orchestrator.
  * Owns the scene, game loop, and wires all systems together.
+ * Handles race lifecycle: start → racing → finish → restart.
+ * Phase 2: AI opponents integrated.
  */
 import * as THREE from 'three';
 import { GAME } from '../config/GameConfig.js';
@@ -11,13 +13,16 @@ import { TrackGenerator } from '../world/TrackGenerator.js';
 import { SceneryPlacer } from '../world/SceneryPlacer.js';
 import { Skybox } from '../world/Skybox.js';
 import { PlayerController } from '../entities/PlayerController.js';
+import { AIRacerManager } from '../entities/AIRacerManager.js';
 import { CameraController } from '../ui/CameraController.js';
 import { AudioManager } from '../audio/AudioManager.js';
 import { HUD } from '../ui/HUD.js';
 
+// Default AI count — user-selectable in Phase 4 via menu
+const AI_COUNT = 6;
+
 export class Game {
     constructor() {
-        // Container
         this.container = document.getElementById('game-container');
 
         // Three.js scene
@@ -37,7 +42,6 @@ export class Game {
         this.input = new InputManager();
         this.audio = new AudioManager();
         this.hud = new HUD();
-        this.clock = new THREE.Clock();
 
         // Camera controller
         this.cameraController = new CameraController(this.camera);
@@ -46,10 +50,14 @@ export class Game {
         this.trackGenerator = null;
         this.player = null;
 
-        // Game loop accumulator
+        // AI
+        this.aiManager = new AIRacerManager();
+
+        // Timing
+        this._lastTime = 0;
         this._accumulator = 0;
 
-        // Audio started flag (needs user gesture)
+        // Audio started flag
         this._audioStarted = false;
 
         // Bind
@@ -68,7 +76,6 @@ export class Game {
         dirLight.position.set(50, 80, 30);
         this.scene.add(dirLight);
 
-        // Subtle fill from below for PS1-era flat lighting feel
         const fillLight = new THREE.DirectionalLight(0x334455, 0.5);
         fillLight.position.set(-20, -10, -30);
         this.scene.add(fillLight);
@@ -87,14 +94,15 @@ export class Game {
         this.scene.add(skybox.create());
 
         // ── Player ──
-        this.player = new PlayerController(
-            this.trackGenerator.centreline,
-            this.trackGenerator.trackMesh
-        );
-        this.scene.add(this.player.mesh);
+        this._spawnPlayer();
 
-        // ── Camera init ──
-        this.cameraController.init(this.player.position, this.player.heading);
+        // ── AI Racers ──
+        this.aiManager.spawn(
+            AI_COUNT,
+            this.trackGenerator.centreline,
+            this.trackGenerator.trackMesh,
+            this.scene
+        );
 
         // ── Audio: start on first user interaction ──
         const startAudio = () => {
@@ -107,26 +115,57 @@ export class Game {
         window.addEventListener('keydown', startAudio, { once: false });
         window.addEventListener('click', startAudio, { once: false });
 
+        // ── Restart key ──
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'KeyR' && this.player && this.player.finished) {
+                this._restartRace();
+            }
+        });
+
         // ── Start game loop ──
-        this.clock.start();
-        this._loop();
+        this._lastTime = performance.now();
+        requestAnimationFrame(this._loop);
+    }
+
+    _spawnPlayer() {
+        if (this.player) {
+            this.scene.remove(this.player.mesh);
+        }
+
+        this.player = new PlayerController(
+            this.trackGenerator.centreline,
+            this.trackGenerator.trackMesh
+        );
+        this.scene.add(this.player.mesh);
+        this.cameraController.init(this.player.position, this.player.heading);
+    }
+
+    _restartRace() {
+        this._spawnPlayer();
+        // Re-spawn AI
+        this.aiManager.spawn(
+            AI_COUNT,
+            this.trackGenerator.centreline,
+            this.trackGenerator.trackMesh,
+            this.scene
+        );
     }
 
     /**
      * Main game loop — fixed-timestep physics + render.
      */
-    _loop() {
+    _loop(now) {
         requestAnimationFrame(this._loop);
 
-        const rawDelta = this.clock.getDelta();
+        const rawDelta = Math.min((now - this._lastTime) / 1000, 0.1);
+        this._lastTime = now;
+
         this._accumulator += rawDelta;
 
-        // Prevent spiral of death
         if (this._accumulator > GAME.FIXED_STEP * GAME.MAX_SUBSTEPS) {
             this._accumulator = GAME.FIXED_STEP * GAME.MAX_SUBSTEPS;
         }
 
-        // Fixed-timestep physics updates
         while (this._accumulator >= GAME.FIXED_STEP) {
             this.input.poll();
 
@@ -135,19 +174,28 @@ export class Game {
                 this.cameraController.toggleMode();
             }
 
-            // Combat SFX
-            if (this.input.justPressed(Actions.PUNCH)) {
-                this.audio.playPunch();
-                this.cameraController.shake(0.15);
-            }
-            if (this.input.justPressed(Actions.KICK)) {
-                this.audio.playKick();
-                this.cameraController.shake(0.2);
-                this.cameraController.fovPunch();
+            // Combat SFX (only during active racing)
+            if (!this.player.finished) {
+                if (this.input.justPressed(Actions.PUNCH)) {
+                    this.audio.playPunch();
+                    this.cameraController.shake(0.15);
+                }
+                if (this.input.justPressed(Actions.KICK)) {
+                    this.audio.playKick();
+                    this.cameraController.shake(0.2);
+                    this.cameraController.fovPunch();
+                }
             }
 
             // Player physics
             this.player.fixedUpdate(GAME.FIXED_STEP, this.input);
+
+            // AI physics
+            this.aiManager.fixedUpdate(
+                GAME.FIXED_STEP,
+                this.player.position,
+                this.player.trackT
+            );
 
             // Audio update
             this.audio.update(this.player.velocity, VEHICLE.MAX_SPEED);
@@ -155,7 +203,7 @@ export class Game {
             this._accumulator -= GAME.FIXED_STEP;
         }
 
-        // Interpolation alpha for smooth rendering
+        // Interpolation
         const alpha = this._accumulator / GAME.FIXED_STEP;
         this.player.interpolate(alpha);
 
@@ -170,6 +218,9 @@ export class Game {
         // Render
         this.renderer.render(this.scene, this.camera);
 
+        // Race position
+        const { position, totalRacers } = this.aiManager.getPlayerPosition(this.player.trackT);
+
         // HUD
         this.hud.render({
             speed: this.player.velocity,
@@ -178,6 +229,13 @@ export class Game {
             maxHealth: VEHICLE.HEALTH,
             progress: this.player.trackT,
             cameraMode: this.cameraController.mode,
+            isWrongWay: this.player.isWrongWay,
+            finished: this.player.finished,
+            raceTime: this.player.raceTime,
+            finishTime: this.player.finishTime,
+            isOffRoad: this.player.isOffRoad,
+            racePosition: position,
+            totalRacers: totalRacers,
         });
     }
 }

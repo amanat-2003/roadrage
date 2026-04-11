@@ -1,6 +1,7 @@
 /**
  * PlayerController.js — Kinematic arcade physics for the player's bike.
  * Handles: acceleration, braking, turning, raycasting ground snap, boundary clamping.
+ * Edge cases: off-road recovery, finish line detection, wrong-way detection.
  */
 import * as THREE from 'three';
 import { VEHICLE } from '../config/VehicleConfig.js';
@@ -17,7 +18,7 @@ const _rayOrigin = new THREE.Vector3();
 export class PlayerController {
     /**
      * @param {THREE.CatmullRomCurve3} centreline
-     * @param {THREE.Mesh} trackMesh - the extruded road mesh for raycasting
+     * @param {THREE.Mesh} trackMesh - the road mesh for raycasting
      */
     constructor(centreline, trackMesh) {
         this.centreline = centreline;
@@ -29,9 +30,9 @@ export class PlayerController {
 
         // Physics state
         this.position = new THREE.Vector3();
-        this.prevPosition = new THREE.Vector3(); // for interpolation
-        this.velocity = 0;           // scalar speed (units/sec)
-        this.heading = 0;            // yaw angle (radians)
+        this.prevPosition = new THREE.Vector3();
+        this.velocity = 0;
+        this.heading = 0;
         this.targetLean = 0;
         this.currentLean = 0;
         this.isGrounded = true;
@@ -41,20 +42,28 @@ export class PlayerController {
         // Combat state
         this.health = VEHICLE.HEALTH;
         this.stunTimer = 0;
-        this.attackTimer = 0;       // >0 means attack animation is playing
-        this.attackType = null;     // 'punch' or 'kick'
+        this.attackTimer = 0;
+        this.attackType = null;
 
         // Progress tracking
-        this.trackT = 0;            // parameter on centreline [0, 1]
+        this.trackT = 0;
+        this.prevTrackT = 0;
         this.finished = false;
+        this.finishTime = 0;        // time when player crossed finish
+        this.isWrongWay = false;
+        this.raceTime = 0;          // total elapsed race time
+
+        // Recovery state
+        this._offTrackTimer = 0;    // how long off-track
+        this._fallRecoveryNeeded = false;
 
         // Place at start
         this._initPosition();
     }
 
     _initPosition() {
-        const startPoint = this.centreline.getPointAt(0);
-        const tangent = this.centreline.getTangentAt(0);
+        const startPoint = this.centreline.getPointAt(0.01);
+        const tangent = this.centreline.getTangentAt(0.01);
 
         this.position.copy(startPoint);
         this.position.y += VEHICLE.RIDE_HEIGHT;
@@ -71,7 +80,23 @@ export class PlayerController {
      * @param {import('../core/InputManager.js').InputManager} input
      */
     fixedUpdate(dt, input) {
+        // Don't update physics if the race is finished
+        if (this.finished) {
+            // Gradually slow down after finish
+            this.velocity *= 0.95;
+            if (Math.abs(this.velocity) < 0.5) this.velocity = 0;
+
+            const forward = new THREE.Vector3(
+                Math.sin(this.heading), 0, Math.cos(this.heading)
+            );
+            this.position.addScaledVector(forward, this.velocity * dt);
+            this.mesh.position.copy(this.position);
+            return;
+        }
+
+        this.raceTime += dt;
         this.prevPosition.copy(this.position);
+        this.prevTrackT = this.trackT;
 
         // Stun reduces control
         const controlFactor = this.stunTimer > 0 ? 0.3 : 1.0;
@@ -88,16 +113,17 @@ export class PlayerController {
         // Drag (passive slowdown)
         this.velocity *= VEHICLE.DRAG_COEFFICIENT;
 
-        // Off-road penalty
+        // Off-road penalty — apply once per tick, not multiplicatively
         if (this.isOffRoad) {
-            this.velocity *= VEHICLE.OFF_ROAD_PENALTY;
+            // Apply a gentle braking force instead of multiplicative penalty
+            this.velocity *= (1 - (1 - VEHICLE.OFF_ROAD_PENALTY) * dt * 3);
         }
 
         // Clamp speed
-        this.velocity = clamp(this.velocity, -10, VEHICLE.MAX_SPEED);
+        this.velocity = clamp(this.velocity, -20, VEHICLE.MAX_SPEED);
 
         // ── Steering ──
-        const speedFactor = clamp(this.velocity / VEHICLE.MAX_SPEED, 0, 1);
+        const speedFactor = clamp(Math.abs(this.velocity) / VEHICLE.MAX_SPEED, 0, 1);
         const gripFactor = 1 - speedFactor * VEHICLE.TURN_GRIP_CURVE;
         let turnInput = 0;
 
@@ -112,9 +138,7 @@ export class PlayerController {
 
         // ── Position integration ──
         const forward = new THREE.Vector3(
-            Math.sin(this.heading),
-            0,
-            Math.cos(this.heading)
+            Math.sin(this.heading), 0, Math.cos(this.heading)
         );
 
         this.position.addScaledVector(forward, this.velocity * dt);
@@ -137,12 +161,18 @@ export class PlayerController {
             this.position.y = hit.point.y + VEHICLE.RIDE_HEIGHT;
             this.isGrounded = true;
             this.verticalVelocity = 0;
+            this._offTrackTimer = 0;
+            this._fallRecoveryNeeded = false;
 
-            // Align to surface normal for hill tilt
-            // (we store the normal for CameraController too)
             this._surfaceNormal = hit.face.normal.clone().transformDirection(this.trackMesh.matrixWorld);
         } else {
             this.isGrounded = false;
+            this._offTrackTimer += dt;
+        }
+
+        // ── Fall recovery — teleport back to track if fallen too far ──
+        if (this.position.y < -20 || this._offTrackTimer > 2.0) {
+            this._recoverToTrack();
         }
 
         // ── Track boundary enforcement ──
@@ -155,14 +185,33 @@ export class PlayerController {
 
         // ── Track progress ──
         this.trackT = findNearestT(this.centreline, this.position, 100);
-        if (this.trackT >= 0.99 && !this.finished) {
+
+        // ── Wrong-way detection ──
+        // If the player is moving and their trackT is decreasing, they're going backwards
+        if (Math.abs(this.velocity) > 5) {
+            const deltaT = this.trackT - this.prevTrackT;
+            // Consider wrong way if deltaT is significantly negative (accounting for noise)
+            this.isWrongWay = deltaT < -0.001;
+        } else {
+            this.isWrongWay = false;
+        }
+
+        // ── Finish line detection ──
+        if (this.trackT >= 0.98 && !this.finished && this.velocity > 0) {
             this.finished = true;
+            this.finishTime = this.raceTime;
+        }
+
+        // ── Prevent going past start line backwards ──
+        if (this.trackT <= 0.005 && this.velocity < 0) {
+            this.velocity = 0;
         }
 
         // ── Attack animation timer ──
         if (this.attackTimer > 0) {
             this.attackTimer -= dt;
-            const progress = 1 - (this.attackTimer / 0.3);
+            const duration = this.attackType === 'punch' ? 0.3 : 0.35;
+            const progress = 1 - (this.attackTimer / duration);
             if (this.attackType === 'punch') {
                 this.bikeModel.animatePunch(progress);
             } else {
@@ -191,8 +240,26 @@ export class PlayerController {
     }
 
     /**
+     * Recover from falling off-track: teleport to the nearest point on centreline.
+     */
+    _recoverToTrack() {
+        const t = clamp(this.trackT, 0.01, 0.99);
+        const point = this.centreline.getPointAt(t);
+        const tangent = this.centreline.getTangentAt(t);
+
+        this.position.copy(point);
+        this.position.y += VEHICLE.RIDE_HEIGHT + 1;
+        this.heading = Math.atan2(tangent.x, tangent.z);
+        this.velocity *= 0.3; // Severe speed penalty for recovery
+        this.verticalVelocity = 0;
+        this.isGrounded = true;
+        this._offTrackTimer = 0;
+        this._fallRecoveryNeeded = false;
+    }
+
+    /**
      * Interpolate visual position for smooth rendering.
-     * @param {number} alpha - interpolation factor
+     * @param {number} alpha
      */
     interpolate(alpha) {
         this.mesh.position.lerpVectors(this.prevPosition, this.position, alpha);
@@ -209,7 +276,6 @@ export class PlayerController {
         this.stunTimer = VEHICLE.HIT_STUN_DURATION;
         if (this.health <= 0) {
             this.health = 0;
-            // TODO: Game over state
         }
     }
 
@@ -219,9 +285,7 @@ export class PlayerController {
      */
     getForward() {
         return new THREE.Vector3(
-            Math.sin(this.heading),
-            0,
-            Math.cos(this.heading)
+            Math.sin(this.heading), 0, Math.cos(this.heading)
         );
     }
 }
